@@ -149,7 +149,22 @@ const pickValue = (row: Record<string, unknown>, map: Record<string, string>, ke
 const toNumber = (value: unknown) => {
   if (value === null || value === undefined || value === "") return 0;
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-  const parsed = Number(String(value).replace(/[^0-9.-]/g, ""));
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  const cleaned = raw.replace(/[^0-9,.-]/g, "");
+  const lastComma = cleaned.lastIndexOf(",");
+  const lastDot = cleaned.lastIndexOf(".");
+  let normalized = cleaned;
+  if (lastComma > -1 && lastDot > -1) {
+    if (lastComma > lastDot) {
+      normalized = cleaned.replace(/\./g, "").replace(",", ".");
+    } else {
+      normalized = cleaned.replace(/,/g, "");
+    }
+  } else if (lastComma > -1) {
+    normalized = cleaned.replace(/,/g, ".");
+  }
+  const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
@@ -190,11 +205,16 @@ const parseWorkbook = async (file: File) => {
   return XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
 };
 
-const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Record<string, unknown>[]) => {
-  if (!costRows.length) return defaultDashboardData;
+const buildDashboardData = (
+  costRows: Record<string, unknown>[],
+  vehicleRows: Record<string, unknown>[],
+  freightRows: Record<string, unknown>[]
+) => {
+  if (!costRows.length && !freightRows.length) return defaultDashboardData;
 
   const vehicleHeader = buildHeaderMap(vehicleRows[0] ?? {});
   const costHeader = buildHeaderMap(costRows[0] ?? {});
+  const freightHeader = buildHeaderMap(freightRows[0] ?? {});
 
   const vehicleMap: Record<string, { truckType: string; trailerType?: string; year?: string }> = {};
   vehicleRows.forEach((row) => {
@@ -213,6 +233,7 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
   const costByTypeMap: Record<string, CostByTruckType> = {};
   const fuelEfficiencyMap: Record<string, FuelEfficiency> = {};
   const topTruckMap: Record<string, TopTruck> = {};
+  const truckIdSet = new Set<string>();
 
   let totalRevenue = 0;
   let totalFuel = 0;
@@ -221,20 +242,66 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
   let totalKm = 0;
   let totalFuelLiters = 0;
 
+  const ensureMonthly = (monthKey: string) => {
+    if (!monthlyMap[monthKey]) {
+      monthlyMap[monthKey] = { month: monthKey, revenue: 0, fuel: 0, maintenance: 0, fixedCosts: 0 };
+    }
+  };
+
+  freightRows.forEach((row) => {
+    const truckId = String(pickValue(row, freightHeader, ["truck id", "truckid", "vehicle id", "id"]) ?? "").trim();
+    const revenue = toNumber(pickValue(row, freightHeader, ["net revenue", "revenue", "freight revenue", "amount", "total revenue"]));
+    const monthKey = toMonthKey(pickValue(row, freightHeader, ["date", "freight date", "invoice date"]));
+
+    ensureMonthly(monthKey);
+    monthlyMap[monthKey].revenue += revenue;
+    totalRevenue += revenue;
+
+    if (truckId) {
+      truckIdSet.add(truckId);
+      if (!topTruckMap[truckId]) {
+        topTruckMap[truckId] = {
+          truckId,
+          truckType: vehicleMap[truckId]?.truckType || "Unknown",
+          year: vehicleMap[truckId]?.year || "",
+          revenue: 0,
+          totalCost: 0,
+          profit: 0,
+          kmTraveled: 0,
+          costPerKm: 0,
+        };
+      }
+      const record = topTruckMap[truckId];
+      record.revenue += revenue;
+      record.profit = record.revenue - record.totalCost;
+    }
+  });
+
   costRows.forEach((row) => {
     const truckId = String(pickValue(row, costHeader, ["truck id", "truckid", "vehicle id", "id"]) ?? "").trim();
     const rowTruckType = String(pickValue(row, costHeader, ["truck type", "trucktype"]) ?? "").trim();
     const vehicleInfo = vehicleMap[truckId];
     const truckType = vehicleInfo?.truckType || rowTruckType || "Unknown";
 
-    const revenue = toNumber(pickValue(row, costHeader, ["revenue", "total revenue", "sales", "income"]));
     const fuel = toNumber(pickValue(row, costHeader, ["fuel", "fuel cost", "fuelcost"]));
     const maintenance = toNumber(pickValue(row, costHeader, ["maintenance", "maintenance cost", "service cost"]));
     const fixedCosts = toNumber(pickValue(row, costHeader, ["fixed costs", "fixed cost", "fixed"]));
-    const km = toNumber(pickValue(row, costHeader, ["km", "kilometers", "kilometres", "distance", "kms", "mileage"]));
+    const km = toNumber(
+      pickValue(row, costHeader, [
+        "km",
+        "km traveled",
+        "km travelled",
+        "kmtraveled",
+        "kmtravelled",
+        "kilometers",
+        "kilometres",
+        "distance",
+        "kms",
+        "mileage",
+      ])
+    );
     const liters = toNumber(pickValue(row, costHeader, ["liters", "litres", "fuel consumed", "fuel liters", "fuelconsumed"]));
 
-    totalRevenue += revenue;
     totalFuel += fuel;
     totalMaintenance += maintenance;
     totalFixed += fixedCosts;
@@ -242,10 +309,7 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
     totalFuelLiters += liters;
 
     const monthKey = toMonthKey(pickValue(row, costHeader, ["date", "transaction date", "service date"]));
-    if (!monthlyMap[monthKey]) {
-      monthlyMap[monthKey] = { month: monthKey, revenue: 0, fuel: 0, maintenance: 0, fixedCosts: 0 };
-    }
-    monthlyMap[monthKey].revenue += revenue;
+    ensureMonthly(monthKey);
     monthlyMap[monthKey].fuel += fuel;
     monthlyMap[monthKey].maintenance += maintenance;
     monthlyMap[monthKey].fixedCosts += fixedCosts;
@@ -282,6 +346,7 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
     fuelEfficiencyMap[truckType].totalKm += km;
 
     if (truckId) {
+      truckIdSet.add(truckId);
       if (!topTruckMap[truckId]) {
         topTruckMap[truckId] = {
           truckId,
@@ -295,7 +360,9 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
         };
       }
       const record = topTruckMap[truckId];
-      record.revenue += revenue;
+      if (record.truckType === "Unknown" && truckType !== "Unknown") {
+        record.truckType = truckType;
+      }
       record.totalCost += fuel + maintenance + fixedCosts;
       record.kmTraveled += km;
       record.profit = record.revenue - record.totalCost;
@@ -335,7 +402,7 @@ const buildDashboardData = (costRows: Record<string, unknown>[], vehicleRows: Re
       totalCosts,
       profit,
       profitMargin,
-      totalFleetSize: Object.keys(topTruckMap).length || Object.keys(vehicleMap).length,
+      totalFleetSize: truckIdSet.size || Object.keys(vehicleMap).length,
       totalKmTraveled: totalKm,
       totalFuelConsumed: totalFuelLiters,
       avgFuelEfficiency: totalFuelLiters ? totalKm / totalFuelLiters : 0,
@@ -364,26 +431,28 @@ export default function HomePage() {
   const [dashboardData, setDashboardData] = useState<DashboardData>(defaultDashboardData);
   const [currentPage, setCurrentPage] = useState("overview");
   const [vehiclesFile, setVehiclesFile] = useState<File | null>(null);
+  const [freightFile, setFreightFile] = useState<File | null>(null);
   const [costFile, setCostFile] = useState<File | null>(null);
   const [status, setStatus] = useState<{ type: "idle" | "error" | "success"; message: string }>({
     type: "idle",
-    message: "Upload your cost and vehicles Excel files to generate the dashboard.",
+    message: "Upload your freight, cost, and vehicles Excel files to generate the dashboard.",
   });
   const [isLoading, setIsLoading] = useState(false);
 
   const handleSubmit = async () => {
-    if (!costFile) {
-      setStatus({ type: "error", message: "Please upload the cost file before generating the dashboard." });
+    if (!costFile || !freightFile) {
+      setStatus({ type: "error", message: "Please upload the freight and cost files before generating the dashboard." });
       return;
     }
     setIsLoading(true);
     setStatus({ type: "idle", message: "Processing files..." });
     try {
-      const [costRows, vehicleRows] = await Promise.all([
+      const [costRows, vehicleRows, freightRows] = await Promise.all([
         parseWorkbook(costFile),
         vehiclesFile ? parseWorkbook(vehiclesFile) : Promise.resolve([]),
+        parseWorkbook(freightFile),
       ]);
-      const nextData = buildDashboardData(costRows, vehicleRows);
+      const nextData = buildDashboardData(costRows, vehicleRows, freightRows);
       setDashboardData(nextData);
       setStatus({ type: "success", message: "Dashboard updated from your Excel files." });
     } catch (error) {
@@ -750,6 +819,10 @@ export default function HomePage() {
             <div className="upload-field">
               <label>Vehicles File</label>
               <input type="file" accept=".xlsx,.xls" onChange={(event) => setVehiclesFile(event.target.files?.[0] ?? null)} />
+            </div>
+            <div className="upload-field">
+              <label>Freight File</label>
+              <input type="file" accept=".xlsx,.xls" onChange={(event) => setFreightFile(event.target.files?.[0] ?? null)} />
             </div>
             <div className="upload-field">
               <label>Cost File</label>
