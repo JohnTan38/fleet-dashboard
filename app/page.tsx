@@ -591,7 +591,7 @@ export default function HomePage() {
                   cx="50%"
                   cy="50%"
                   labelLine={false}
-                  label={(entry) => entry.truckType}
+                  label={(entry) => (entry.payload as CostByTruckType | undefined)?.truckType ?? ""}
                   outerRadius={100}
                   fill="#8884d8"
                   dataKey="totalCost"
