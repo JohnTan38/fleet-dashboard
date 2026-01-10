@@ -78,6 +78,13 @@ type DashboardData = {
   topTrucks: TopTruck[];
 };
 
+type QAEntry = {
+  id: string;
+  question: string;
+  answer: string;
+  status: "streaming" | "done" | "error";
+};
+
 const defaultDashboardData: DashboardData = {
   kpis: {
     totalRevenue: 5461023.69,
@@ -127,6 +134,21 @@ const defaultDashboardData: DashboardData = {
 };
 
 const normalizeKey = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+const KM_KEYS = [
+  "km",
+  "km traveled",
+  "km travelled",
+  "kmtraveled",
+  "kmtravelled",
+  "kilometers",
+  "kilometres",
+  "distance",
+  "kms",
+  "mileage",
+];
+
+const LITER_KEYS = ["liters", "litres", "fuel consumed", "fuel liters", "fuelconsumed"];
 
 const buildHeaderMap = (row: Record<string, unknown>) => {
   const map: Record<string, string> = {};
@@ -203,6 +225,63 @@ const parseWorkbook = async (file: File) => {
   const workbook = XLSX.read(buffer, { type: "array" });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
+};
+
+const buildEfficiencyTable = (rows: Record<string, unknown>[], header: Record<string, string>, keyLabels: string[]) => {
+  const map: Record<string, { id: string; totalKm: number; totalLiters: number }> = {};
+
+  rows.forEach((row) => {
+    const key = pickValue(row, header, keyLabels);
+    if (key === null || key === undefined || key === "") return;
+    const id = String(key).trim();
+    if (!id) return;
+    const km = toNumber(pickValue(row, header, KM_KEYS));
+    const liters = toNumber(pickValue(row, header, LITER_KEYS));
+    if (!map[id]) {
+      map[id] = { id, totalKm: 0, totalLiters: 0 };
+    }
+    map[id].totalKm += km;
+    map[id].totalLiters += liters;
+  });
+
+  return Object.values(map)
+    .map((entry) => ({
+      ...entry,
+      kmPerLiter: entry.totalLiters ? entry.totalKm / entry.totalLiters : 0,
+    }))
+    .sort((a, b) => b.kmPerLiter - a.kmPerLiter || b.totalKm - a.totalKm);
+};
+
+const buildDriverNameMap = (rows: Record<string, unknown>[], header: Record<string, string>) => {
+  const map: Record<string, string> = {};
+  rows.forEach((row) => {
+    const id = pickValue(row, header, ["drive id", "driver id", "id"]);
+    const name = pickValue(row, header, ["driver", "driver name", "name"]);
+    if (!id || !name) return;
+    map[String(id).trim()] = String(name).trim();
+  });
+  return map;
+};
+
+const getYearFromMonthKey = (monthKey: string) => {
+  const match = monthKey.match(/^(\d{4})-/);
+  return match ? match[1] : "Unknown";
+};
+
+const buildDriveLookup = (rows: Record<string, unknown>[], header: Record<string, string>) => {
+  const map: Record<string, { driveId: string; km: number }> = {};
+  rows.forEach((row) => {
+    const truckId = String(pickValue(row, header, ["truck id", "truckid", "vehicle id", "id"]) ?? "").trim();
+    const driveId = String(pickValue(row, header, ["drive id", "driver id", "id"]) ?? "").trim();
+    if (!truckId || !driveId) return;
+    const monthKey = toMonthKey(pickValue(row, header, ["date", "transaction date", "service date"]));
+    const km = toNumber(pickValue(row, header, KM_KEYS));
+    const key = `${truckId}::${monthKey}`;
+    if (!map[key] || km > map[key].km) {
+      map[key] = { driveId, km };
+    }
+  });
+  return map;
 };
 
 const buildDashboardData = (
@@ -286,21 +365,8 @@ const buildDashboardData = (
     const fuel = toNumber(pickValue(row, costHeader, ["fuel", "fuel cost", "fuelcost"]));
     const maintenance = toNumber(pickValue(row, costHeader, ["maintenance", "maintenance cost", "service cost"]));
     const fixedCosts = toNumber(pickValue(row, costHeader, ["fixed costs", "fixed cost", "fixed"]));
-    const km = toNumber(
-      pickValue(row, costHeader, [
-        "km",
-        "km traveled",
-        "km travelled",
-        "kmtraveled",
-        "kmtravelled",
-        "kilometers",
-        "kilometres",
-        "distance",
-        "kms",
-        "mileage",
-      ])
-    );
-    const liters = toNumber(pickValue(row, costHeader, ["liters", "litres", "fuel consumed", "fuel liters", "fuelconsumed"]));
+    const km = toNumber(pickValue(row, costHeader, KM_KEYS));
+    const liters = toNumber(pickValue(row, costHeader, LITER_KEYS));
 
     totalFuel += fuel;
     totalMaintenance += maintenance;
@@ -415,6 +481,92 @@ const buildDashboardData = (
   };
 };
 
+const buildAskContext = (
+  costRows: Record<string, unknown>[],
+  vehicleRows: Record<string, unknown>[],
+  freightRows: Record<string, unknown>[],
+  driverRows: Record<string, unknown>[]
+) => {
+  const costHeader = buildHeaderMap(costRows[0] ?? {});
+  const vehicleHeader = buildHeaderMap(vehicleRows[0] ?? {});
+  const freightHeader = buildHeaderMap(freightRows[0] ?? {});
+  const driverHeader = buildHeaderMap(driverRows[0] ?? {});
+  const driverNameMap = buildDriverNameMap(driverRows, driverHeader);
+  const dashboard = buildDashboardData(costRows, vehicleRows, freightRows);
+  const driveLookup = buildDriveLookup(costRows, costHeader);
+
+  const driveEfficiency = buildEfficiencyTable(costRows, costHeader, ["drive id", "driver id"]);
+  const truckEfficiency = buildEfficiencyTable(costRows, costHeader, ["truck id", "truckid", "vehicle id", "id"]);
+  const truckTypeEfficiency = buildEfficiencyTable(costRows, costHeader, ["truck type", "trucktype"]);
+
+  const revenueByDrive: Record<string, number> = {};
+  const revenueByDriveByYear: Record<string, Record<string, number>> = {};
+  let matchedFreight = 0;
+  let totalFreight = 0;
+
+  freightRows.forEach((row) => {
+    totalFreight += 1;
+    const truckId = String(pickValue(row, freightHeader, ["truck id", "truckid", "vehicle id", "id"]) ?? "").trim();
+    const revenue = toNumber(pickValue(row, freightHeader, ["net revenue", "revenue", "freight revenue", "amount", "total revenue"]));
+    const monthKey = toMonthKey(pickValue(row, freightHeader, ["date", "freight date", "invoice date"]));
+    const lookup = truckId ? driveLookup[`${truckId}::${monthKey}`] : undefined;
+    if (!lookup?.driveId) return;
+    matchedFreight += 1;
+    revenueByDrive[lookup.driveId] = (revenueByDrive[lookup.driveId] ?? 0) + revenue;
+    const year = getYearFromMonthKey(monthKey);
+    if (!revenueByDriveByYear[year]) revenueByDriveByYear[year] = {};
+    revenueByDriveByYear[year][lookup.driveId] = (revenueByDriveByYear[year][lookup.driveId] ?? 0) + revenue;
+  });
+
+  const toRevenueList = (map: Record<string, number>) =>
+    Object.entries(map)
+      .map(([driveId, revenue]) => ({
+        driveId,
+        driverName: driverNameMap[driveId] ?? "Unknown",
+        revenue,
+      }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+  return {
+    kpis: dashboard.kpis,
+    rowCounts: {
+      cost: costRows.length,
+      freight: freightRows.length,
+      vehicles: vehicleRows.length,
+      drivers: driverRows.length,
+    },
+    availableColumns: {
+      cost: Object.keys(costRows[0] ?? {}),
+      freight: Object.keys(freightRows[0] ?? {}),
+      vehicles: Object.keys(vehicleRows[0] ?? {}),
+      drivers: Object.keys(driverRows[0] ?? {}),
+    },
+    efficiencyByDrive: driveEfficiency
+      .map((entry) => ({ ...entry, driverName: driverNameMap[entry.id] ?? "Unknown" }))
+      .slice(0, 15),
+    efficiencyByTruck: truckEfficiency.slice(0, 15),
+    efficiencyByTruckType: truckTypeEfficiency.slice(0, 15),
+    driverFields: {
+      driveId: pickValue(driverRows[0] ?? {}, driverHeader, ["drive id", "driver id", "id"]) ? "available" : "missing",
+      driverName: pickValue(driverRows[0] ?? {}, driverHeader, ["driver", "driver name", "name"]) ? "available" : "missing",
+    },
+    vehicleFields: {
+      truckId: pickValue(vehicleRows[0] ?? {}, vehicleHeader, ["truck id", "truckid", "vehicle id", "id"]) ? "available" : "missing",
+      truckType: pickValue(vehicleRows[0] ?? {}, vehicleHeader, ["truck type", "trucktype"]) ? "available" : "missing",
+    },
+    freightFields: {
+      truckId: pickValue(freightRows[0] ?? {}, freightHeader, ["truck id", "truckid", "vehicle id", "id"]) ? "available" : "missing",
+      revenue: pickValue(freightRows[0] ?? {}, freightHeader, ["net revenue", "revenue", "freight revenue", "amount", "total revenue"]) ? "available" : "missing",
+    },
+    revenueByDrive: {
+      joinMethod: "Freight rows joined to cost rows by Truck ID + Month; Drive ID picked by max KM within that key.",
+      joinCoverage: { matched: matchedFreight, total: totalFreight },
+      topOverall: toRevenueList(revenueByDrive).slice(0, 15),
+      top2018: toRevenueList(revenueByDriveByYear["2018"] ?? {}).slice(0, 15),
+    },
+  };
+};
+
 const KPICard = ({ label, value, variant = "primary", change }: { label: string; value: string | number; variant?: string; change?: string }) => (
   <div className={`kpi-card ${variant}`}>
     <div className="kpi-label">{label}</div>
@@ -433,11 +585,19 @@ export default function HomePage() {
   const [vehiclesFile, setVehiclesFile] = useState<File | null>(null);
   const [freightFile, setFreightFile] = useState<File | null>(null);
   const [costFile, setCostFile] = useState<File | null>(null);
+  const [driversFile, setDriversFile] = useState<File | null>(null);
+  const [question, setQuestion] = useState("");
+  const [qaEntries, setQaEntries] = useState<QAEntry[]>([]);
+  const [askStatus, setAskStatus] = useState<{ type: "idle" | "error" | "success"; message: string }>({
+    type: "idle",
+    message: "",
+  });
   const [status, setStatus] = useState<{ type: "idle" | "error" | "success"; message: string }>({
     type: "idle",
-    message: "Upload your freight, cost, and vehicles Excel files to generate the dashboard.",
+    message: "Upload your freight, cost, and optional vehicles/drivers Excel files to generate the dashboard.",
   });
   const [isLoading, setIsLoading] = useState(false);
+  const [isAsking, setIsAsking] = useState(false);
 
   const handleSubmit = async () => {
     if (!costFile || !freightFile) {
@@ -490,17 +650,121 @@ export default function HomePage() {
     pdf.save("fleet-dashboard.pdf");
   };
 
+  const handleAskQuestion = async () => {
+    const trimmed = question.trim();
+    if (!trimmed) {
+      setAskStatus({ type: "error", message: "Please type a question before asking." });
+      return;
+    }
+    if (!costFile) {
+      setAskStatus({ type: "error", message: "Please upload the cost file before asking questions." });
+      return;
+    }
+
+    setIsAsking(true);
+    setAskStatus({ type: "idle", message: "Analyzing your data..." });
+
+    const entryId = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`;
+    setQaEntries((prev) => [{ id: entryId, question: trimmed, answer: "", status: "streaming" }, ...prev]);
+
+    try {
+      const [costRows, vehicleRows, freightRows, driverRows] = await Promise.all([
+        parseWorkbook(costFile),
+        vehiclesFile ? parseWorkbook(vehiclesFile) : Promise.resolve([]),
+        freightFile ? parseWorkbook(freightFile) : Promise.resolve([]),
+        driversFile ? parseWorkbook(driversFile) : Promise.resolve([]),
+      ]);
+
+      const context = buildAskContext(costRows, vehicleRows, freightRows, driverRows);
+      const response = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: trimmed, context }),
+      });
+
+      if (!response.ok || !response.body) {
+        const errorText = await response.text();
+        setQaEntries((prev) =>
+          prev.map((entry) =>
+            entry.id === entryId
+              ? { ...entry, status: "error", answer: errorText || "Unable to reach the assistant." }
+              : entry
+          )
+        );
+        setAskStatus({ type: "error", message: "Unable to get a response from the assistant." });
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let doneStreaming = false;
+
+      while (!doneStreaming) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let lineEnd = buffer.indexOf("\n");
+        while (lineEnd >= 0) {
+          const line = buffer.slice(0, lineEnd).trimEnd();
+          buffer = buffer.slice(lineEnd + 1);
+          if (line.startsWith("data:")) {
+            const data = line.replace(/^data:\s*/, "").trim();
+            if (data === "[DONE]") {
+              doneStreaming = true;
+              break;
+            }
+            try {
+              const event = JSON.parse(data);
+              const delta =
+                typeof event?.delta === "string"
+                  ? event.delta
+                  : typeof event?.response?.output_text?.delta === "string"
+                    ? event.response.output_text.delta
+                    : typeof event?.output_text?.delta === "string"
+                      ? event.output_text.delta
+                      : event?.type === "response.output_text.delta" && typeof event?.delta === "string"
+                        ? event.delta
+                        : "";
+              if (delta) {
+                setQaEntries((prev) =>
+                  prev.map((entry) => (entry.id === entryId ? { ...entry, answer: entry.answer + delta } : entry))
+                );
+              }
+            } catch {
+              // Ignore malformed chunks
+            }
+          }
+          lineEnd = buffer.indexOf("\n");
+        }
+      }
+
+      setQaEntries((prev) => prev.map((entry) => (entry.id === entryId ? { ...entry, status: "done" } : entry)));
+      setAskStatus({ type: "success", message: "Response ready." });
+    } catch (error) {
+      setQaEntries((prev) =>
+        prev.map((entry) =>
+          entry.id === entryId ? { ...entry, status: "error", answer: "An error occurred while processing the request." } : entry
+        )
+      );
+      setAskStatus({ type: "error", message: "Unable to process the question right now." });
+    } finally {
+      setIsAsking(false);
+    }
+  };
+
   const pages = useMemo(
     () => ({
       overview: { name: "Overview", icon: "OV" },
       revenue: { name: "Revenue and Costs", icon: "RC" },
       fleet: { name: "Fleet Performance", icon: "FP" },
       fuel: { name: "Fuel Analytics", icon: "FU" },
+      ask: { name: "Ask Question", icon: "AQ" },
     }),
     []
   );
 
-  const pageOrder = ["overview", "revenue", "fleet", "fuel"];
+  const pageOrder = ["overview", "revenue", "fleet", "fuel", "ask"];
   const currentIndex = pageOrder.indexOf(currentPage);
   const prevPage = currentIndex > 0 ? pageOrder[currentIndex - 1] : null;
   const nextPage = currentIndex < pageOrder.length - 1 ? pageOrder[currentIndex + 1] : null;
@@ -777,6 +1041,64 @@ export default function HomePage() {
     );
   };
 
+  const AskPage = () => (
+    <div className="page-content">
+      <div className="page-header">
+        <h1 className="page-title">Ask Fleet Questions</h1>
+        <p className="page-subtitle">Query the uploaded data with AI-powered insights</p>
+      </div>
+
+      <div className="ask-card">
+        <label className="ask-label" htmlFor="ask-input">
+          Your question
+        </label>
+        <textarea
+          id="ask-input"
+          className="ask-input"
+          placeholder="Which Drive ID is most fuel efficient (KM per L)?"
+          value={question}
+          onChange={(event) => setQuestion(event.target.value)}
+          rows={4}
+        />
+        <div className="ask-examples">
+          <span className="ask-label">Example questions</span>
+          <div className="example-list">
+            {[
+              "Which Drive ID is most fuel efficient (KM per L)?",
+              "Which truck type has the best fuel efficiency?",
+              "Top 3 trucks by profit this period?",
+            ].map((example) => (
+              <button key={example} type="button" className="example-item" onClick={() => setQuestion(example)}>
+                {example}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="ask-actions">
+          <button className="btn btn-primary" onClick={handleAskQuestion} disabled={isAsking}>
+            {isAsking ? "Asking..." : "Ask Question"}
+          </button>
+          <span className={`status-text ${askStatus.type === "error" ? "error" : ""}`}>{askStatus.message}</span>
+        </div>
+      </div>
+
+      <div className="qa-list">
+        {qaEntries.map((entry) => (
+          <div key={entry.id} className="qa-entry">
+            <div className="qa-question">
+              <span className="qa-label">Question</span>
+              <p>{entry.question}</p>
+            </div>
+            <div className={`qa-answer ${entry.status === "error" ? "error" : ""}`}>
+              <span className="qa-label">Answer</span>
+              <p>{entry.answer || (entry.status === "streaming" ? "Thinking..." : "No response yet.")}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   const renderPage = () => {
     switch (currentPage) {
       case "revenue":
@@ -785,6 +1107,8 @@ export default function HomePage() {
         return <FleetPage />;
       case "fuel":
         return <FuelPage />;
+      case "ask":
+        return <AskPage />;
       default:
         return <OverviewPage />;
     }
@@ -827,6 +1151,10 @@ export default function HomePage() {
             <div className="upload-field">
               <label>Cost File</label>
               <input type="file" accept=".xlsx,.xls" onChange={(event) => setCostFile(event.target.files?.[0] ?? null)} />
+            </div>
+            <div className="upload-field">
+              <label>Drivers File</label>
+              <input type="file" accept=".xlsx,.xls" onChange={(event) => setDriversFile(event.target.files?.[0] ?? null)} />
             </div>
           </div>
           <button className="btn btn-primary" onClick={handleSubmit} disabled={isLoading}>
