@@ -61,7 +61,7 @@ type FuelEfficiency = {
 type MaintenanceByYearRow = {
   year: string;
   total: number;
-} & Record<string, number>;
+} & Record<string, number | string>;
 
 type TopTruck = {
   truckId: string;
