@@ -623,9 +623,36 @@ export default function HomePage() {
   };
 
   const handleExport = async () => {
-    const target = document.querySelector(".main-content");
+    const target = document.querySelector(".main-content") as HTMLElement | null;
     if (!target) return;
-    const canvas = await html2canvas(target as HTMLElement, { scale: 2, backgroundColor: "#f8fafc" });
+    if (document.fonts?.ready) {
+      await document.fonts.ready;
+    }
+    const canvas = await html2canvas(target, {
+      scale: 2,
+      backgroundColor: "#f8fafc",
+      scrollY: -window.scrollY,
+      scrollX: -window.scrollX,
+      windowWidth: target.scrollWidth,
+      windowHeight: target.scrollHeight,
+      onclone: (doc) => {
+        const clonedTarget = doc.querySelector(".main-content") as HTMLElement | null;
+        if (clonedTarget) {
+          clonedTarget.style.background = "#f8fafc";
+          clonedTarget.style.backdropFilter = "none";
+        }
+        doc
+          .querySelectorAll(
+            ".page-content, .page-header, .kpi-card, .chart-container, .table-container, .upload-card, .ask-card, .qa-entry"
+          )
+          .forEach((node) => {
+            const element = node as HTMLElement;
+            element.style.animation = "none";
+            element.style.transform = "none";
+            element.style.opacity = "1";
+          });
+      },
+    });
     const imgData = canvas.toDataURL("image/png");
     const pdf = new jsPDF("p", "pt", "a4");
 
