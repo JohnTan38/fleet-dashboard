@@ -58,6 +58,11 @@ type FuelEfficiency = {
   totalKm: number;
 };
 
+type MaintenanceByYearRow = {
+  year: string;
+  total: number;
+} & Record<string, number>;
+
 type TopTruck = {
   truckId: string;
   truckType: string;
@@ -75,6 +80,7 @@ type DashboardData = {
   costByTruckType: CostByTruckType[];
   fuelEfficiency: FuelEfficiency[];
   fuelTrend: { month: string; liters: number }[];
+  maintenanceByYear: MaintenanceByYearRow[];
   topTrucks: TopTruck[];
 };
 
@@ -124,6 +130,7 @@ const defaultDashboardData: DashboardData = {
     { month: "2018-05", liters: 21871.48 },
     { month: "2018-06", liters: 21605.51 },
   ],
+  maintenanceByYear: [],
   topTrucks: [
     { truckId: "23", truckType: "TRAILER", year: "2014", revenue: 701472.71, totalCost: 242823.24, profit: 458649.47, kmTraveled: 105966.0, costPerKm: 2.291 },
     { truckId: "17", truckType: "TRACTOR", year: "2011", revenue: 527629.53, totalCost: 370213.94, profit: 157415.59, kmTraveled: 130682.0, costPerKm: 2.833 },
@@ -311,6 +318,7 @@ const buildDashboardData = (
   const fuelTrendMap: Record<string, number> = {};
   const costByTypeMap: Record<string, CostByTruckType> = {};
   const fuelEfficiencyMap: Record<string, FuelEfficiency> = {};
+  const maintenanceByYearMap: Record<string, { year: string; total: number; byType: Record<string, number> }> = {};
   const topTruckMap: Record<string, TopTruck> = {};
   const truckIdSet = new Set<string>();
 
@@ -375,6 +383,7 @@ const buildDashboardData = (
     totalFuelLiters += liters;
 
     const monthKey = toMonthKey(pickValue(row, costHeader, ["date", "transaction date", "service date"]));
+    const yearKey = getYearFromMonthKey(monthKey);
     ensureMonthly(monthKey);
     monthlyMap[monthKey].fuel += fuel;
     monthlyMap[monthKey].maintenance += maintenance;
@@ -382,6 +391,12 @@ const buildDashboardData = (
 
     if (!fuelTrendMap[monthKey]) fuelTrendMap[monthKey] = 0;
     fuelTrendMap[monthKey] += liters;
+
+    if (!maintenanceByYearMap[yearKey]) {
+      maintenanceByYearMap[yearKey] = { year: yearKey, total: 0, byType: {} };
+    }
+    maintenanceByYearMap[yearKey].total += maintenance;
+    maintenanceByYearMap[yearKey].byType[truckType] = (maintenanceByYearMap[yearKey].byType[truckType] ?? 0) + maintenance;
 
     if (!costByTypeMap[truckType]) {
       costByTypeMap[truckType] = {
@@ -440,6 +455,16 @@ const buildDashboardData = (
     .map(([month, liters]) => ({ month, liters }))
     .sort((a, b) => a.month.localeCompare(b.month));
 
+  const maintenanceByYear = Object.values(maintenanceByYearMap)
+    .map((entry) => {
+      const row: MaintenanceByYearRow = { year: entry.year, total: entry.total };
+      Object.entries(entry.byType).forEach(([truckType, value]) => {
+        row[truckType] = value;
+      });
+      return row;
+    })
+    .sort((a, b) => a.year.localeCompare(b.year));
+
   const costByTruckType = Object.values(costByTypeMap).map((item) => ({
     ...item,
     costPerKm: item.totalKm ? item.totalCost / item.totalKm : 0,
@@ -477,6 +502,7 @@ const buildDashboardData = (
     costByTruckType,
     fuelEfficiency,
     fuelTrend,
+    maintenanceByYear,
     topTrucks,
   };
 };
@@ -917,8 +943,9 @@ export default function HomePage() {
   };
 
   const FleetPage = () => {
-    const { costByTruckType, topTrucks } = dashboardData;
+    const { costByTruckType, topTrucks, maintenanceByYear } = dashboardData;
     const colors = ["#0ea5a4", "#0ea5e9", "#f59e0b", "#16a34a"];
+    const maintenanceTypes = costByTruckType.map((item) => item.truckType);
 
     return (
       <div className="page-content">
@@ -938,6 +965,27 @@ export default function HomePage() {
               <Legend />
               <Bar dataKey="costPerKm" fill="#0ea5e9" radius={[8, 8, 0, 0]} />
             </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="chart-container">
+          <h2 className="chart-title">Maintenance Cost by Year (by Truck Type)</h2>
+          <ResponsiveContainer width="100%" height={340}>
+            <ComposedChart data={maintenanceByYear}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis dataKey="year" stroke="#64748b" />
+              <YAxis yAxisId="left" stroke="#64748b" tickFormatter={(value) => formatNumber(value)} />
+              <YAxis yAxisId="right" orientation="right" stroke="#64748b" tickFormatter={(value) => formatNumber(value)} />
+              <Tooltip
+                contentStyle={{ background: "white", border: "1px solid #e2e8f0", borderRadius: "8px" }}
+                formatter={(value: number) => formatCurrency(value)}
+              />
+              <Legend />
+              {maintenanceTypes.map((truckType, index) => (
+                <Bar key={truckType} dataKey={truckType} yAxisId="left" fill={colors[index % colors.length]} radius={[6, 6, 0, 0]} />
+              ))}
+              <Line type="monotone" dataKey="total" yAxisId="right" stroke="#1f2937" strokeWidth={3} dot={{ r: 4 }} />
+            </ComposedChart>
           </ResponsiveContainer>
         </div>
 
