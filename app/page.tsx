@@ -978,7 +978,7 @@ export default function HomePage() {
               <YAxis yAxisId="right" orientation="right" stroke="#64748b" tickFormatter={(value) => formatNumber(value)} />
               <Tooltip
                 contentStyle={{ background: "white", border: "1px solid #e2e8f0", borderRadius: "8px" }}
-                formatter={(value: number) => formatCurrency(value)}
+                formatter={(value) => formatCurrency(typeof value === "number" ? value : Number(value) || 0)}
               />
               <Legend />
               {maintenanceTypes.map((truckType, index) => (
